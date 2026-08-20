@@ -717,6 +717,7 @@ function buildGame(cfg){
     flags:{witchPotions:{save:true,poison:true},guardLastTarget:null,idiotRevealed:[],noVoteRights:[],hiddenWolfOut:false},
     votes:{}, history:[], stepIndex:0, stepCounter:0, winner:null,
     apiStats:{calls:0,estTokens:0},
+    offlineReasons:{},
     advanced:cfg.advanced||{},
     speechesByStep:{} // 辅助：当日发言记录
   };
@@ -861,15 +862,53 @@ async function act(player, actionType, ctx){
 }
 
 /* ============ 7. AI 客户端 ============ */
+let apiWarned = false;
 function getApiConfig(player){
-  if(player.apiMode==="custom" && player.apiConfig && player.apiConfig.apiKey) return player.apiConfig;
+  if(player.apiMode==="custom" && player.apiConfig && player.apiConfig.apiKey){
+    // 补齐缺失字段，避免自定义配置里 model/baseUrl 为空导致请求失败
+    const g = settings.globalAPI || {};
+    const c = player.apiConfig;
+    return {
+      baseUrl: c.baseUrl || g.baseUrl || "https://api.deepseek.com",
+      apiKey: c.apiKey,
+      model: c.model || g.model || "deepseek-chat",
+      temperature: (c.temperature!=null ? c.temperature : (g.temperature!=null?g.temperature:0.9)),
+      maxTokens: c.maxTokens || g.maxTokens || 600,
+      timeoutMs: c.timeoutMs || g.timeoutMs || 60000
+    };
+  }
   return settings.globalAPI;
+}
+function httpErr(resp){
+  const d=resp && resp.data;
+  if(!d){
+    return resp && resp.status===0
+      ? "网络/CORS 错误（浏览器无法直连该接口，需支持 CORS 或换用支持浏览器直连的接口）"
+      : ("请求失败(" + (resp?resp.status:"?") + ")");
+  }
+  const e=d.error;
+  if(e) return (e.message||e.code||JSON.stringify(e));
+  if(d.message) return d.message;
+  return "请求失败(" + (resp.status||"?") + ")";
+}
+function markOffline(player, err){
+  if(game){
+    game.apiStats.fails=(game.apiStats.fails||0)+1;
+    game.offlineReasons = game.offlineReasons || {};
+    if(player && player.seat!=null) game.offlineReasons[player.seat]=err||"未知错误";
+  }
+  if(!apiWarned){
+    apiWarned=true;
+    toast("AI 调用失败："+(err||"未知错误")+"，已切换法官代打。请在「设置」检查 API。");
+  }
 }
 async function aiAct(player, actionType, ctx){
   const cfg=getApiConfig(player);
   const instruction=promptInstruction(player, actionType, ctx);
   if(!cfg.apiKey){
-    return {json:fallback(player,actionType,ctx), thinking:null, offline:true};
+    const err="未配置 API Key";
+    markOffline(player, err);
+    return {json:fallback(player,actionType,ctx), thinking:null, offline:true, err};
   }
   const messages=[
     {role:"system",content:RULES_SYSTEM()},
@@ -877,17 +916,21 @@ async function aiAct(player, actionType, ctx){
     {role:"system",content:memoryBlock(player)},
     {role:"user",content:instruction}
   ];
-  const body={model:cfg.model,messages,temperature:cfg.temperature||0.9,max_tokens:cfg.maxTokens||600,stream:false};
-  let lastText="";
+  const body={model:cfg.model,messages,temperature:cfg.temperature!=null?cfg.temperature:0.9,max_tokens:cfg.maxTokens||600,stream:false};
+  let lastText="", lastErr="";
   for(let attempt=0; attempt<2; attempt++){
     try{
       const resp = await fetchJSON(cfg, body);
       if(resp.ok){
         game.apiStats.calls++;
         const data=resp.data;
-        const text = data.choices&&data.choices[0]&&data.choices[0].message;
+        if(!data || !data.choices || !data.choices[0] || !data.choices[0].message){
+          lastErr = (data && data.error) ? ("接口返回错误："+(data.error.message||data.error)) : "接口返回格式异常（无 choices）";
+          continue;
+        }
+        const msg = data.choices[0].message;
         const thinking = extractThinking(data);
-        const content = text ? (text.content||"") : "";
+        const content = msg.content || "";
         lastText=content;
         const parsed = parseJSON(content);
         if(parsed){ game.apiStats.estTokens += estimateTokens(messages,content); return {json:parsed, thinking, model:data.model||cfg.model}; }
@@ -897,27 +940,50 @@ async function aiAct(player, actionType, ctx){
         ])}));
         if(fix.ok){
           game.apiStats.calls++;
-          const d2=fix.data; const c2=d2.choices&&d2.choices[0]&&d2.choices[0].message;
-          const p2=parseJSON(c2?c2.content:""); if(p2){ game.apiStats.estTokens+=estimateTokens(messages,c2.content); return {json:p2, thinking:extractThinking(d2), model:d2.model||cfg.model}; }
+          const d2=fix.data;
+          const c2=d2.choices&&d2.choices[0]&&d2.choices[0].message;
+          const p2=parseJSON(c2?c2.content:"");
+          if(p2){ game.apiStats.estTokens+=estimateTokens(messages,c2.content); return {json:p2, thinking:extractThinking(d2), model:d2.model||cfg.model}; }
           lastText=c2?c2.content:"";
+          lastErr="模型未返回有效 JSON";
+        } else {
+          lastErr = httpErr(fix);
         }
       } else {
-        if(resp.status===401||resp.status===403){ return {json:fallback(player,actionType,ctx), thinking:null, offline:true, keyErr:true}; }
+        lastErr = httpErr(resp);
+        if(resp.status===401||resp.status===403){
+          const err="认证失败("+resp.status+")，API Key 无效或已过期";
+          markOffline(player, err);
+          return {json:fallback(player,actionType,ctx), thinking:null, offline:true, err, keyErr:true};
+        }
         if(resp.status===429){ await sleep(3000*(attempt+1)); continue; }
       }
-    }catch(e){ lastText = "CORS/网络错误"; }
+    }catch(e){ lastText="异常："; lastErr="CORS/网络错误（浏览器无法直连该接口）"; }
   }
-  return {json:fallback(player,actionType,ctx), thinking:null, offline:true, raw:lastText};
+  if(!lastErr) lastErr = "未知错误";
+  markOffline(player, lastErr);
+  return {json:fallback(player,actionType,ctx), thinking:null, offline:true, err:lastErr, raw:lastText};
 }
 function fetchJSON(cfg, body){
-  const base=(cfg.baseUrl||"").replace(/\/+$/,"");
+  const base=(cfg.baseUrl||"https://api.deepseek.com").replace(/\/+$/,"");
   const url=base+"/chat/completions";
-  return fetch(url,{
+  const timeout=cfg.timeoutMs||60000;
+  const ctrl = (typeof AbortController!=="undefined") ? new AbortController() : null;
+  const timer = ctrl ? setTimeout(()=>ctrl.abort(), timeout) : null;
+  const opt={
     method:"POST",
     headers:{"Authorization":"Bearer "+cfg.apiKey,"Content-Type":"application/json"},
     body:JSON.stringify(body)
-  }).then(async r=>({ok:r.ok,status:r.status,data:await r.json().catch(()=>null)}))
-    .catch(e=>({ok:false,status:0,data:null,error:e}));
+  };
+  if(ctrl) opt.signal=ctrl.signal;
+  return fetch(url,opt).then(async r=>{
+    if(timer) clearTimeout(timer);
+    let data=null; try{ data=await r.json(); }catch(e){}
+    return {ok:r.ok,status:r.status,data};
+  }).catch(e=>{
+    if(timer) clearTimeout(timer);
+    return {ok:false,status:0,data:null,error:e};
+  });
 }
 function extractThinking(data){
   try{
@@ -1129,7 +1195,8 @@ function stepCardHTML(step){
   let body = d.text || "";
   if(step.type==="wolf_chat" && step.payload && step.payload.speech){ body = step.payload.speech; }
   const offline = step.payload && step.payload.offline;
-  const errNote = offline ? `<div class="muted" style="font-size:11px;">（${step.actor?getPlayer(step.actor).name+"号":""} AI 掉线，法官代打）</div>` : "";
+  const reason = offline ? esc((game && game.offlineReasons && game.offlineReasons[step.actor]) || (step.payload && step.payload.err) || "") : "";
+  const errNote = offline ? `<div class="muted" style="font-size:11px;color:#c7744f;">（${step.actor?getPlayer(step.actor).name+"号":""} AI 掉线，法官代打${reason?"："+reason:""}）</div>` : "";
   const bodyHtml = `<div class="step-body ${body.length>80?'clamp':''}">${esc(body)}</div>${body.length>80?'<div class="step-expand">展开</div>':''}${errNote}`;
   return `<div class="step-card ${cls}">${head}${thinking}${bodyHtml}</div>`;
 }
@@ -1304,7 +1371,7 @@ function openGameMenu(){
     <div class="btn danger" style="justify-content:flex-start;margin-top:8px" id="gm-restart">${icon("close","sm")} 重新开始</div>`);
   paintIcons(document.querySelector("#modal"));
   $("gm-rules").onclick=()=>{ closeSheet(); showRules(); };
-  $("gm-stats").onclick=()=>{ closeSheet(); openSheet(`<div class="handle"></div><h3>调用统计</h3><div class="card">本局 API 调用：${game.apiStats.calls} 次<br>估算 token：约 ${game.apiStats.estTokens}（≈${est}K）</div>`); paintIcons(document.querySelector("#modal")); };
+  $("gm-stats").onclick=()=>{ closeSheet(); openSheet(`<div class="handle"></div><h3>调用统计</h3><div class="card">本局 API 调用：${game.apiStats.calls} 次<br>估算 token：约 ${game.apiStats.estTokens}（≈${est}K）<br>失败/降级：${game.apiStats.fails||0} 次</div>`); paintIcons(document.querySelector("#modal")); };
   $("gm-export").onclick=()=>{ closeSheet(); exportRecord(); };
   $("gm-save").onclick=()=>{ closeSheet(); saveGame(); showScreen("screen-home"); renderHome(); };
   $("gm-restart").onclick=()=>{ closeSheet(); confirmBox("重新开始","将放弃当前对局，是否继续？",()=>{ store.remove(KEYS.save); game=null; showScreen("screen-home"); renderHome(); }); };
@@ -1327,6 +1394,7 @@ function openMyPanel(){
 
 /* ============ 14. 游戏流程编排 ============ */
 async function startGame(cfg){
+  apiWarned = false;
   buildGame(cfg);
   currentView = cfg.mode==="play" ? cfg.userSeat : "god";
   // 私信身份
@@ -2029,15 +2097,28 @@ async function generateCharacter(){
 }
 async function testConnection(baseUrl,apiKey,model,outEl){
   if(!apiKey){ outEl.textContent="请先填写 API Key"; return; }
+  if(!model){ outEl.textContent="请填写模型名称"; return; }
   outEl.textContent="测试中...";
-  const cfg={baseUrl,apiKey,model,temperature:0,maxTokens:50};
+  const base=(baseUrl||"https://api.deepseek.com").replace(/\/+$/,"");
   try{
-    const base=(baseUrl||"").replace(/\/+$/,"");
-    const r=await fetch(base+"/chat/completions",{method:"POST",headers:{"Authorization":"Bearer "+apiKey,"Content-Type":"application/json"},body:JSON.stringify({model,messages:[{role:"user",content:"ping"}],max_tokens:10})});
-    if(r.ok){ const d=await r.json().catch(()=>null); const rm=d&&d.model||model; outEl.textContent=`已连通：${rm}`; }
-    else if(r.status===0) outEl.textContent="CORS/网络错误：请更换支持浏览器直连的接口";
-    else { let m=""; try{ m=(await r.json()).error&&(await r.json()).error.message; }catch(e){} outEl.textContent=`失败(${r.status}) ${m}`; }
-  }catch(e){ outEl.textContent="请求异常，可能 CORS 不支持浏览器直连"; }
+    const r=await fetch(base+"/chat/completions",{method:"POST",headers:{"Authorization":"Bearer "+apiKey,"Content-Type":"application/json"},body:JSON.stringify({model,messages:[{role:"user",content:"只回复两个字：收到"}],max_tokens:20,stream:false})});
+    if(!r.ok){
+      let msg="";
+      try{ const d=await r.json(); msg=(d&&d.error&&(d.error.message||d.error.code))||(d&&d.message)||""; }catch(e){}
+      outEl.textContent=`失败(${r.status})${msg?"："+msg:""}`;
+      return;
+    }
+    let d=null; try{ d=await r.json(); }catch(e){ outEl.textContent="已连通，但返回内容不是有效 JSON"; return; }
+    const c=d&&d.choices&&d.choices[0]&&d.choices[0].message&&d.choices[0].message.content;
+    const rm=(d&&d.model)||model;
+    if(!c || !String(c).trim()){
+      outEl.textContent=`已连通 ${rm}，但未返回文本（该模型可能不支持 chat/completions）`;
+    } else {
+      outEl.textContent=`已连通：${rm}（返回“${String(c).trim().slice(0,10)}”）`;
+    }
+  }catch(e){
+    outEl.textContent="网络/CORS 错误：浏览器无法直连该接口，请更换支持 CORS 的接口";
+  }
 }
 
 /* ============ 设置 ============ */
