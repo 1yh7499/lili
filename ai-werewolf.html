@@ -854,7 +854,8 @@ function pauseForStep(step){
 /* ---- 行动请求（AI 或人类） ---- */
 async function act(player, actionType, ctx){
   if(player.isHuman && game.meta.mode==="play"){
-    return await requestUserAction(player, actionType, ctx);
+    const r = await requestUserAction(player, actionType, ctx);
+    return { json: r, thinking: null };
   }
   return await aiAct(player, actionType, ctx);
 }
@@ -1242,7 +1243,7 @@ function requestUserAction(player, actionType, ctx){
           };
         });
         $("ua-confirm").onclick=()=>{
-          if(multi) resolve({couple:sel});
+          if(multi){ if(sel.length<2){ toast("请选择两名玩家作为情侣"); return; } resolve({couple:sel}); }
           else if(actionType==="vote") resolve({vote:sel[0]});
           else if(actionType==="seer") resolve({check:sel[0]});
           else if(actionType==="guard") resolve({protect:sel[0]});
